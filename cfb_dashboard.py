@@ -299,8 +299,19 @@ def main():
             st.warning("No games or lines found for that week yet.")
         else:
             picks = all_bets[all_bets["EV %"] >= min_ev].sort_values("EV %", ascending=False)
+            # join conference info from slate so we can filter by it
+            if not slate.empty:
+                picks = picks.merge(slate[["Game", "Home Conf", "Away Conf"]].drop_duplicates(),
+                                    on="Game", how="left")
+                tab1_confs = sorted({c for c in slate["Home Conf"].tolist() + slate["Away Conf"].tolist() if c})
+                sel_tab1_confs = st.multiselect("Filter by conference", tab1_confs, default=[],
+                                                key="tab1_conf_filter",
+                                                help="Show only bets where at least one team is in the selected conference(s).")
+                if sel_tab1_confs:
+                    picks = picks[picks["Home Conf"].isin(sel_tab1_confs) | picks["Away Conf"].isin(sel_tab1_confs)]
+                picks = picks.drop(columns=["Home Conf", "Away Conf"], errors="ignore")
             st.dataframe(picks, hide_index=True, column_config=BET_COLS)
-            if (picks["Points Edge"].abs() > 7).any():
+            if not picks.empty and (picks["Points Edge"].abs() > 7).any():
                 st.warning("Some edges are 7+ points. That usually means something the model can't see "
                            "(injuries, a QB change, a tiny sample), not a free lunch. Double-check those.")
 
