@@ -62,6 +62,32 @@ def cfbd(endpoint, key, **params):
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def team_conferences(key, season):
+    """Return a dict of {team_name: conference} for FBS teams."""
+    df = cfbd("teams/fbs", key, year=season)
+    if df.empty or "conference" not in df.columns:
+        return {}
+    name_col = "school" if "school" in df.columns else df.columns[0]
+    return dict(zip(df[name_col], df["conference"]))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def ap_rankings(key, season, week):
+    """Return a set of team names that appear in the AP Top 25 for the given week."""
+    df = cfbd("rankings", key, year=season, week=week, seasonType="regular")
+    if df.empty:
+        return set()
+    # Each row has a 'polls' list; find the AP Top 25 poll
+    ranked = set()
+    for _, row in df.iterrows():
+        for poll in row.get("polls", []):
+            if poll.get("poll") == "AP Top 25":
+                for entry in poll.get("ranks", []):
+                    ranked.add(entry.get("school", ""))
+    return ranked
+
+
 def training_games(key, season, prior_weight):
     """Finished regular-season games from this season (weight 1) and last season (smaller weight)."""
     frames = []
@@ -226,9 +252,20 @@ def main():
         rt = fit_ratings(games, alpha)
         sched = cfbd("games", key, year=int(season), week=int(week), seasonType="regular")
         mk = market_lines(key, int(season), int(week))
+        conf_map = team_conferences(key, int(season))
+        ranked_teams = ap_rankings(key, int(season), int(week))
     except requests.HTTPError as e:
         st.error(f"CFBD API error: {e}. Check your API key.")
         st.stop()
+
+    # ---- sidebar filters (conference + Top 25)
+    sb.subheader("Filters")
+    all_confs = sorted({c for c in conf_map.values() if c})
+    sel_confs = sb.multiselect("Conference", all_confs, default=[],
+                               help="Show only games where at least one team is in the selected conference(s). "
+                                    "Leave blank for all games.")
+    top25_only = sb.checkbox("Top 25 games only",
+                             help="Show only games where at least one team is AP-ranked this week.")
 
     # ---- score every game on this week's slate
     slate, all_bets = [], []
@@ -236,8 +273,19 @@ def main():
         sched["neutralSite"] = sched["neutralSite"].fillna(False).astype(bool)
         sched = sched.merge(mk, on="id", how="left")
         for g in sched.itertuples():
+            home_conf = conf_map.get(g.homeTeam, "")
+            away_conf = conf_map.get(g.awayTeam, "")
+            # conference filter
+            if sel_confs and home_conf not in sel_confs and away_conf not in sel_confs:
+                continue
+            # Top 25 filter
+            if top25_only and g.homeTeam not in ranked_teams and g.awayTeam not in ranked_teams:
+                continue
             summary, bets = evaluate(g.homeTeam, g.awayTeam, g.neutralSite, g.spread, g.total,
                                      g.ml_home, g.ml_away, rt, s)
+            # tag the summary row with conference info
+            summary["Home Conf"] = home_conf
+            summary["Away Conf"] = away_conf
             slate.append(summary)
             all_bets += bets
     slate, all_bets = pd.DataFrame(slate), pd.DataFrame(all_bets)
