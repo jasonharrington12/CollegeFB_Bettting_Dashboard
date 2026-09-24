@@ -307,9 +307,20 @@ def main():
     with tab2:
         st.caption("Spread is from the home team's view (negative = home favored). "
                    "Edge = model minus market, so a positive Spread Edge favors the home team covering.")
-        st.dataframe(slate, hide_index=True, column_config={
-            c: st.column_config.NumberColumn(format="%.1f") for c in slate.columns
-            if c not in ("Game", "Model Score")} if not slate.empty else None)
+        if not slate.empty:
+            tab2_confs = sorted({c for c in slate["Home Conf"].tolist() + slate["Away Conf"].tolist() if c})
+            sel_tab2_confs = st.multiselect("Filter by conference", tab2_confs, default=[],
+                                            key="tab2_conf_filter",
+                                            help="Filter rows to games where at least one team is in the selected conference(s).")
+            filtered_slate = slate
+            if sel_tab2_confs:
+                mask = slate["Home Conf"].isin(sel_tab2_confs) | slate["Away Conf"].isin(sel_tab2_confs)
+                filtered_slate = slate[mask]
+            st.dataframe(filtered_slate, hide_index=True, column_config={
+                c: st.column_config.NumberColumn(format="%.1f") for c in filtered_slate.columns
+                if c not in ("Game", "Model Score", "Home Conf", "Away Conf")})
+        else:
+            st.warning("No games found for that week yet.")
 
     with tab3:
         st.caption("Pick any two teams and type in the lines from your own sportsbook.")
