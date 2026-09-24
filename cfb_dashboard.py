@@ -236,8 +236,36 @@ def predict(rt, home, away, neutral):
 # ML bets beyond this threshold are too extreme to be reliable — suppress them.
 ML_ODDS_CAP = 400
 
+# Alternate spread offsets (applied on top of the market spread)
+ALT_SPREAD_OFFSETS = [-6.5, -3.5, 3.5, 6.5]
 
-def evaluate(home, away, neutral, spread, total, ml_home, ml_away, rt, s):
+
+def parlay_american_odds(win_probs):
+    """
+    Given a list of true win probabilities, compute the fair parlay payout (American odds)
+    and expected value vs the standard -110 parlay pricing sportsbooks use.
+    Returns (fair_odds, book_payout, ev_pct).
+    """
+    if not win_probs:
+        return None, None, None
+    combined_p = 1.0
+    for p in win_probs:
+        combined_p *= p
+    # Fair American odds for the parlay winner
+    fair_profit = (1 / combined_p) - 1
+    fair_odds = fair_profit * 100 if fair_profit <= 1 else fair_profit * 100
+
+    # Standard book parlay payout: each leg priced at -110
+    leg_decimal = 1 + STD_PROFIT          # 1.909...
+    book_decimal = leg_decimal ** len(win_probs)
+    book_profit = book_decimal - 1
+    book_odds = int(book_profit * 100) if book_profit <= 1 else int(book_profit * 100)
+
+    ev_pct = 100 * (combined_p * book_profit - (1 - combined_p))
+    return combined_p, book_odds, ev_pct
+
+
+def evaluate(home, away, neutral, spread, total, ml_home, ml_away, rt, s, alt_spreads=False):
     """Model one game. Returns (summary row, list of bets). `spread` is from the HOME team's view."""
     hp, ap = predict(rt, home, away, neutral)
     margin, tot = hp - ap, hp + ap                       # margin > 0 means the home team wins
@@ -245,29 +273,38 @@ def evaluate(home, away, neutral, spread, total, ml_home, ml_away, rt, s):
     game = f"{away} @ {home}"
     bets = []
 
-    def add(bet, p, profit, edge=np.nan):
+    def add(bet, p, profit, edge=np.nan, bet_type="Spread"):
         ev = p * profit - (1 - p)                        # expected profit per $1 risked
         kelly = max(ev / profit, 0)                      # Kelly fraction of bankroll
         stake = min(s["bankroll"] * s["kelly_frac"] * kelly, 0.05 * s["bankroll"])  # cap at 5%
-        bets.append({"Game": game, "Bet": bet, "Model Win %": 100 * p, "Breakeven %": 100 / (1 + profit),
+        bets.append({"Game": game, "Bet": bet, "Type": bet_type,
+                     "Model Win %": 100 * p, "Breakeven %": 100 / (1 + profit),
                      "Points Edge": edge, "EV %": 100 * ev, "Suggested Stake": stake})
 
     if not pd.isna(spread):
         edge = margin + spread                           # home covers if margin + spread > 0
         p_cover = norm_cdf(edge / s["sd_margin"])
-        add(f"{home} {spread:+.1f}", p_cover, STD_PROFIT, edge)
-        add(f"{away} {-spread:+.1f}", 1 - p_cover, STD_PROFIT, -edge)
+        add(f"{home} {spread:+.1f}", p_cover, STD_PROFIT, edge, "Spread")
+        add(f"{away} {-spread:+.1f}", 1 - p_cover, STD_PROFIT, -edge, "Spread")
+        # alternate spreads: shift the market line by each offset
+        if alt_spreads:
+            for offset in ALT_SPREAD_OFFSETS:
+                alt = spread + offset                    # e.g. market -7 + 3.5 = alt -3.5
+                alt_edge = margin + alt
+                p_alt = norm_cdf(alt_edge / s["sd_margin"])
+                add(f"{home} {alt:+.1f} (alt)", p_alt, STD_PROFIT, alt_edge, "Alt Spread")
+                add(f"{away} {-alt:+.1f} (alt)", 1 - p_alt, STD_PROFIT, -alt_edge, "Alt Spread")
     if not pd.isna(total):
         p_over = 1 - norm_cdf((total - tot) / s["sd_total"])
-        add(f"Over {total:.1f}", p_over, STD_PROFIT, tot - total)
-        add(f"Under {total:.1f}", 1 - p_over, STD_PROFIT, total - tot)
+        add(f"Over {total:.1f}", p_over, STD_PROFIT, tot - total, "Total")
+        add(f"Under {total:.1f}", 1 - p_over, STD_PROFIT, total - tot, "Total")
     # Only show ML bets when the odds are within a realistic range (±400).
     # Extreme underdog MLs (+500, +1000, etc.) produce misleadingly high model EV
     # because a simple ratings model can't reliably price 10-to-1 shots.
     if (not pd.isna(ml_home) and not pd.isna(ml_away)
             and abs(ml_home) <= ML_ODDS_CAP and abs(ml_away) <= ML_ODDS_CAP):
-        add(f"{home} ML ({ml_home:+.0f})", p_home, ml_to_profit(ml_home))
-        add(f"{away} ML ({ml_away:+.0f})", 1 - p_home, ml_to_profit(ml_away))
+        add(f"{home} ML ({ml_home:+.0f})", p_home, ml_to_profit(ml_home), bet_type="ML")
+        add(f"{away} ML ({ml_away:+.0f})", 1 - p_home, ml_to_profit(ml_away), bet_type="ML")
 
     summary = {"Game": game, "Model Score": f"{home} {hp:.0f} - {away} {ap:.0f}",
                "Model Spread": -margin, "Market Spread": spread, "Spread Edge": margin + spread,
@@ -384,15 +421,41 @@ def main():
             all_bets += bets
     slate, all_bets = pd.DataFrame(slate), pd.DataFrame(all_bets)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Best Bets", "Full Slate", "Matchup Explorer", "Team Ratings"])
+    # ---- re-score slate with alt spreads enabled (used for Best Bets + Parlay tabs)
+    slate_alt, all_bets_alt = [], []
+    if not sched.empty:
+        for g in sched.itertuples():
+            home_conf = conf_map.get(g.homeTeam, "")
+            away_conf = conf_map.get(g.awayTeam, "")
+            if sel_confs and home_conf not in sel_confs and away_conf not in sel_confs:
+                continue
+            if top25_only and g.homeTeam not in ranked_teams and g.awayTeam not in ranked_teams:
+                continue
+            summary, bets = evaluate(g.homeTeam, g.awayTeam, g.neutralSite, g.spread, g.total,
+                                     g.ml_home, g.ml_away, rt, s, alt_spreads=True)
+            summary["Home Conf"] = home_conf
+            summary["Away Conf"] = away_conf
+            slate_alt.append(summary)
+            all_bets_alt += bets
+    all_bets_alt = pd.DataFrame(all_bets_alt)
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Best Bets", "Full Slate", "Matchup Explorer", "Team Ratings", "Parlay Builder"])
 
     with tab1:
         st.caption(f"Week {week}: bets where the model's EV is at least {min_ev:.1f}%. "
                    "Spreads and totals assume -110 odds; moneylines use the median price across books.")
-        if all_bets.empty:
+        if all_bets_alt.empty:
             st.warning("No games or lines found for that week yet.")
         else:
-            picks = all_bets[all_bets["EV %"] >= min_ev].sort_values("EV %", ascending=False)
+            # ---- bet type filter
+            all_types = ["Spread", "Alt Spread", "Total", "ML"]
+            sel_types = st.multiselect("Bet type", all_types, default=["Spread", "Total", "ML"],
+                                       key="tab1_type_filter",
+                                       help="Filter by bet type. 'Alt Spread' shows ±3.5 / ±6.5 alternate lines.")
+            picks = all_bets_alt[all_bets_alt["EV %"] >= min_ev].copy()
+            if sel_types:
+                picks = picks[picks["Type"].isin(sel_types)]
+            picks = picks.sort_values("EV %", ascending=False)
             # join conference info from slate so we can filter by it
             if not slate.empty:
                 picks = picks.merge(slate[["Game", "Home Conf", "Away Conf"]].drop_duplicates(),
@@ -404,7 +467,8 @@ def main():
                 if sel_tab1_confs:
                     picks = picks[picks["Home Conf"].isin(sel_tab1_confs) | picks["Away Conf"].isin(sel_tab1_confs)]
                 picks = picks.drop(columns=["Home Conf", "Away Conf"], errors="ignore")
-            st.dataframe(picks, hide_index=True, column_config=BET_COLS)
+            BET_COLS_WITH_TYPE = {**BET_COLS}
+            st.dataframe(picks, hide_index=True, column_config=BET_COLS_WITH_TYPE)
             if not picks.empty and (picks["Points Edge"].abs() > 7).any():
                 st.warning("Some edges are 7+ points. That usually means something the model can't see "
                            "(injuries, a QB change, a tiny sample), not a free lunch. Double-check those.")
@@ -446,6 +510,53 @@ def main():
         m3.metric("Model total", f"{summary['Model Total']:.1f}")
         m4.metric("Home win %", f"{summary['Home Win %']:.1f}%")
         st.dataframe(pd.DataFrame(bets), hide_index=True, column_config=BET_COLS)
+
+    with tab5:
+        st.caption("Pick your legs below. The builder shows combined win probability, "
+                   "estimated payout at standard -110 parlay pricing, and overall EV.")
+        if all_bets_alt.empty:
+            st.warning("No bets available — check your season/week settings.")
+        else:
+            # Only offer positive-EV bets as parlay legs to keep the list useful
+            parlay_pool = all_bets_alt[all_bets_alt["EV %"] >= min_ev].copy()
+            # Let user also filter by type for the parlay pool
+            p_types = st.multiselect("Include bet types in parlay pool", ["Spread", "Alt Spread", "Total", "ML"],
+                                     default=["Spread", "Total", "ML"], key="parlay_type_filter")
+            if p_types:
+                parlay_pool = parlay_pool[parlay_pool["Type"].isin(p_types)]
+            parlay_pool = parlay_pool.sort_values("EV %", ascending=False)
+
+            if parlay_pool.empty:
+                st.info("No positive-EV bets match the current filters. Lower the minimum EV slider or change bet types.")
+            else:
+                leg_options = parlay_pool["Bet"].tolist()
+                # Suggest the top 3 by EV as a default starting point
+                default_legs = leg_options[:min(3, len(leg_options))]
+                chosen_legs = st.multiselect("Select parlay legs", leg_options, default=default_legs,
+                                             help="Choose 2–8 legs. The builder assumes each leg is independent.")
+
+                if len(chosen_legs) < 2:
+                    st.info("Select at least 2 legs to build a parlay.")
+                else:
+                    chosen = parlay_pool[parlay_pool["Bet"].isin(chosen_legs)].drop_duplicates("Bet")
+                    win_probs = (chosen["Model Win %"] / 100).tolist()
+                    combined_p, book_odds, ev_pct = parlay_american_odds(win_probs)
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Legs", len(chosen_legs))
+                    m2.metric("Combined Win %", f"{100 * combined_p:.2f}%")
+                    book_odds_str = f"+{book_odds}" if book_odds >= 0 else str(book_odds)
+                    m3.metric("Est. Payout (book)", book_odds_str)
+                    ev_color = "normal" if ev_pct >= 0 else "inverse"
+                    m4.metric("Parlay EV %", f"{ev_pct:.1f}%", delta=f"{ev_pct:.1f}%", delta_color=ev_color)
+
+                    st.subheader("Parlay legs")
+                    st.dataframe(chosen[["Game", "Bet", "Type", "Model Win %", "EV %", "Points Edge"]],
+                                 hide_index=True, column_config=BET_COLS)
+
+                    if len(chosen_legs) > 4:
+                        st.warning("Parlays of 5+ legs have very low hit rates even with positive EV. "
+                                   "Consider splitting into smaller parlays.")
 
     with tab4:
         st.caption("Points vs. an average FBS team. Defense is flipped so higher = better for both columns.")
