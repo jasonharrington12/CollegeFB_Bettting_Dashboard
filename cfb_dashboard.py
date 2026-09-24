@@ -240,26 +240,28 @@ ML_ODDS_CAP = 400
 ALT_SPREAD_OFFSETS = [-6.5, -3.5, 3.5, 6.5]
 
 
-def parlay_american_odds(win_probs):
+def parlay_american_odds(win_probs, leg_profits):
     """
-    Given a list of true win probabilities, compute the fair parlay payout (American odds)
-    and expected value vs the standard -110 parlay pricing sportsbooks use.
-    Returns (fair_odds, book_payout, ev_pct).
+    Given true win probabilities and per-leg profit-per-$1-risked (from actual odds),
+    compute combined win probability, estimated book payout (American odds), and EV.
+    leg_profits: list of profit-per-$1 for each leg (e.g. STD_PROFIT for -110,
+                 or ml_to_profit(ml) for a moneyline leg).
     """
-    if not win_probs:
+    if not win_probs or not leg_profits:
         return None, None, None
     combined_p = 1.0
     for p in win_probs:
         combined_p *= p
-    # Fair American odds for the parlay winner
-    fair_profit = (1 / combined_p) - 1
-    fair_odds = fair_profit * 100 if fair_profit <= 1 else fair_profit * 100
-
-    # Standard book parlay payout: each leg priced at -110
-    leg_decimal = 1 + STD_PROFIT          # 1.909...
-    book_decimal = leg_decimal ** len(win_probs)
+    # Book parlay payout: multiply each leg's decimal odds (1 + profit per $1)
+    book_decimal = 1.0
+    for profit in leg_profits:
+        book_decimal *= (1 + profit)
     book_profit = book_decimal - 1
-    book_odds = int(book_profit * 100) if book_profit <= 1 else int(book_profit * 100)
+    # Convert to American odds
+    if book_profit >= 1:
+        book_odds = int(book_profit * 100)
+    else:
+        book_odds = int(-100 / book_profit)
 
     ev_pct = 100 * (combined_p * book_profit - (1 - combined_p))
     return combined_p, book_odds, ev_pct
@@ -279,7 +281,8 @@ def evaluate(home, away, neutral, spread, total, ml_home, ml_away, rt, s, alt_sp
         stake = min(s["bankroll"] * s["kelly_frac"] * kelly, 0.05 * s["bankroll"])  # cap at 5%
         bets.append({"Game": game, "Bet": bet, "Type": bet_type,
                      "Model Win %": 100 * p, "Breakeven %": 100 / (1 + profit),
-                     "Points Edge": edge, "EV %": 100 * ev, "Suggested Stake": stake})
+                     "Points Edge": edge, "EV %": 100 * ev, "Suggested Stake": stake,
+                     "Profit": profit})   # stored for parlay payout calc
 
     if not pd.isna(spread):
         edge = margin + spread                           # home covers if margin + spread > 0
@@ -539,7 +542,8 @@ def main():
                     st.info("Not enough qualifying legs for this tier this week.")
                     return
                 win_probs = (legs_df["Model Win %"] / 100).tolist()
-                combined_p, book_odds, ev_pct = parlay_american_odds(win_probs)
+                leg_profits = legs_df["Profit"].tolist()
+                combined_p, book_odds, ev_pct = parlay_american_odds(win_probs, leg_profits)
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Legs", len(legs_df))
                 m2.metric("Combined Win %", f"{100 * combined_p:.1f}%")
