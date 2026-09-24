@@ -14,8 +14,12 @@ How it works (short version):
     1. Pull finished games from the CollegeFootballData (CFBD) API.
     2. Fit a "points model": every team gets an offense number and a defense number.
        Predicted score = league average + team offense + opponent defense + home field.
-    3. Turn the predicted scores into a spread, a total, and a win probability.
-    4. Compare those to the market lines and compute expected value (EV) for each bet.
+    3. Calibrate the model's uncertainty (sd_margin, sd_total) from real historical
+       spread/total results so cover probabilities reflect actual hit rates.
+    4. Turn the predicted scores into a spread, a total, and a win probability.
+    5. Compare those to the market lines and compute expected value (EV) for each bet.
+       Moneylines beyond ±400 are suppressed — extreme-dog MLs almost always look
+       profitable on paper but never are in practice.
 """
 import re
 from datetime import date
@@ -126,6 +130,69 @@ def market_lines(key, season, week):
     )
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def historical_lines(key, season):
+    """
+    Pull closing lines + results for completed games this season and last season.
+    Returns a DataFrame with columns: model_margin, actual_margin, spread, total, actual_total
+    used to calibrate sd_margin and sd_total from real data.
+    """
+    rows = []
+    for year in (season, season - 1):
+        games_df = cfbd("games", key, year=year, seasonType="regular")
+        if games_df.empty:
+            continue
+        games_df = games_df.dropna(subset=["homePoints", "awayPoints"])
+        lines_df = cfbd("lines", key, year=year, seasonType="regular")
+        if lines_df.empty:
+            continue
+        # build a per-game closing spread (average across books)
+        line_rows = []
+        for _, g in lines_df.iterrows():
+            for ln in g["lines"]:
+                s = field(ln, "spread")
+                ou = field(ln, "overUnder")
+                if s is not None:
+                    line_rows.append({"id": g["id"], "spread": s, "total": ou})
+        if not line_rows:
+            continue
+        ldf = pd.DataFrame(line_rows).apply(pd.to_numeric, errors="coerce")
+        ldf = ldf.groupby("id", as_index=False).agg(spread=("spread", "mean"), total=("total", "mean"))
+        merged = games_df.merge(ldf, on="id", how="inner")
+        for row in merged.itertuples():
+            actual_margin = row.homePoints - row.awayPoints
+            actual_total = row.homePoints + row.awayPoints
+            rows.append({
+                "actual_margin": actual_margin,
+                "spread": row.spread,           # market spread (home team's view, negative = favored)
+                "cover_error": actual_margin - (-row.spread),  # positive = home covered by more than expected
+                "actual_total": actual_total,
+                "total": row.total,
+                "total_error": actual_total - row.total,
+            })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def calibrate_sigmas(hist_df, fallback_margin=15.0, fallback_total=13.0):
+    """
+    Estimate sd_margin and sd_total from how spread/total results are actually distributed.
+    Uses the std dev of (actual_margin + market_spread) — i.e. how far games deviated from
+    the closing line — which is the right sigma for cover-probability calculations.
+    Falls back to provided defaults if there isn't enough data.
+    """
+    sd_margin = fallback_margin
+    sd_total = fallback_total
+    if hist_df.empty:
+        return sd_margin, sd_total
+    ce = hist_df["cover_error"].dropna()
+    te = hist_df["total_error"].dropna()
+    if len(ce) >= 20:
+        sd_margin = float(ce.std())
+    if len(te) >= 20:
+        sd_total = float(te.std())
+    return sd_margin, sd_total
+
+
 # ---------------------------------------------------------------- the model
 @st.cache_data
 def fit_ratings(games, alpha):
@@ -166,6 +233,10 @@ def predict(rt, home, away, neutral):
     return home_pts, away_pts
 
 
+# ML bets beyond this threshold are too extreme to be reliable — suppress them.
+ML_ODDS_CAP = 400
+
+
 def evaluate(home, away, neutral, spread, total, ml_home, ml_away, rt, s):
     """Model one game. Returns (summary row, list of bets). `spread` is from the HOME team's view."""
     hp, ap = predict(rt, home, away, neutral)
@@ -190,7 +261,11 @@ def evaluate(home, away, neutral, spread, total, ml_home, ml_away, rt, s):
         p_over = 1 - norm_cdf((total - tot) / s["sd_total"])
         add(f"Over {total:.1f}", p_over, STD_PROFIT, tot - total)
         add(f"Under {total:.1f}", 1 - p_over, STD_PROFIT, total - tot)
-    if not pd.isna(ml_home) and not pd.isna(ml_away):
+    # Only show ML bets when the odds are within a realistic range (±400).
+    # Extreme underdog MLs (+500, +1000, etc.) produce misleadingly high model EV
+    # because a simple ratings model can't reliably price 10-to-1 shots.
+    if (not pd.isna(ml_home) and not pd.isna(ml_away)
+            and abs(ml_home) <= ML_ODDS_CAP and abs(ml_away) <= ML_ODDS_CAP):
         add(f"{home} ML ({ml_home:+.0f})", p_home, ml_to_profit(ml_home))
         add(f"{away} ML ({ml_away:+.0f})", 1 - p_home, ml_to_profit(ml_away))
 
@@ -254,9 +329,28 @@ def main():
         mk = market_lines(key, int(season), int(week))
         conf_map = team_conferences(key, int(season))
         ranked_teams = ap_rankings(key, int(season), int(week))
+        hist_df = historical_lines(key, int(season))
     except requests.HTTPError as e:
         st.error(f"CFBD API error: {e}. Check your API key.")
         st.stop()
+
+    # ---- calibrate sigmas from historical spread/total results
+    cal_sd_margin, cal_sd_total = calibrate_sigmas(
+        hist_df,
+        fallback_margin=s["sd_margin"],
+        fallback_total=s["sd_total"],
+    )
+    # Override the sidebar manual values with data-calibrated ones, but let the sidebar
+    # sliders serve as a floor so the user can still nudge them if desired.
+    s["sd_margin"] = max(s["sd_margin"], cal_sd_margin)
+    s["sd_total"] = max(s["sd_total"], cal_sd_total)
+
+    n_hist = len(hist_df) if not hist_df.empty else 0
+    if n_hist >= 20:
+        sb.caption(f"📊 Sigmas auto-calibrated from {n_hist} historical games: "
+                   f"margin σ={cal_sd_margin:.1f} pts, total σ={cal_sd_total:.1f} pts.")
+    else:
+        sb.caption("⚠️ Not enough historical lines data to auto-calibrate — using manual slider values.")
 
     # ---- sidebar filters (conference + Top 25)
     sb.subheader("Filters")
