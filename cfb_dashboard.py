@@ -519,10 +519,12 @@ def main():
             st.warning("No bets available — check your season/week settings.")
         else:
             # shared pool: positive EV, user-selected bet types
-            p_types = st.multiselect(
+            pcol1, pcol2 = st.columns([3, 1])
+            p_types = pcol1.multiselect(
                 "Include bet types", ["Spread", "Alt Spread", "Total", "ML"],
                 default=["Spread", "Total", "ML"], key="parlay_type_filter",
             )
+            max_legs = pcol2.number_input("Max legs per parlay", min_value=2, max_value=12, value=4, step=1)
             base_pool = all_bets_alt[all_bets_alt["EV %"] >= min_ev].copy()
             if p_types:
                 base_pool = base_pool[base_pool["Type"].isin(p_types)]
@@ -556,24 +558,24 @@ def main():
                 st.info("No positive-EV bets match the current filters. "
                         "Lower the minimum EV % slider or add more bet types.")
             else:
-                # ── LOCKS: win % ≥ 65, up to 4 legs, sorted by win % desc
+                # ── LOCKS: win % ≥ 65, up to max_legs, sorted by win % desc
                 locks = (base_pool[base_pool["Model Win %"] >= 65]
                          .drop_duplicates("Game")
                          .sort_values("Model Win %", ascending=False)
-                         .head(4))
+                         .head(max_legs))
 
-                # ── MAYBE: win % 55–65, up to 4 legs, sorted by EV desc
+                # ── MAYBE: win % 55–65, up to max_legs, sorted by EV desc
                 maybe = (base_pool[(base_pool["Model Win %"] >= 55) &
                                    (base_pool["Model Win %"] < 65)]
                          .drop_duplicates("Game")
                          .sort_values("EV %", ascending=False)
-                         .head(4))
+                         .head(max_legs))
 
-                # ── LONG SHOT: win % < 55 but positive EV, up to 4 legs, sorted by EV desc
+                # ── LONG SHOT: win % < 55 but positive EV, up to max_legs, sorted by EV desc
                 longshot = (base_pool[base_pool["Model Win %"] < 55]
                             .drop_duplicates("Game")
                             .sort_values("EV %", ascending=False)
-                            .head(4))
+                            .head(max_legs))
 
                 render_parlay(
                     "Locks", "🔒", locks,
