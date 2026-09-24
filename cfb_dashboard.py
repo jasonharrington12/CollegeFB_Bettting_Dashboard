@@ -512,51 +512,81 @@ def main():
         st.dataframe(pd.DataFrame(bets), hide_index=True, column_config=BET_COLS)
 
     with tab5:
-        st.caption("Pick your legs below. The builder shows combined win probability, "
-                   "estimated payout at standard -110 parlay pricing, and overall EV.")
+        st.caption("Three auto-built parlays based on confidence tier. "
+                   "Locks = highest win %, Long Shots = high payout/EV, Maybe = the middle ground.")
+
         if all_bets_alt.empty:
             st.warning("No bets available — check your season/week settings.")
         else:
-            # Only offer positive-EV bets as parlay legs to keep the list useful
-            parlay_pool = all_bets_alt[all_bets_alt["EV %"] >= min_ev].copy()
-            # Let user also filter by type for the parlay pool
-            p_types = st.multiselect("Include bet types in parlay pool", ["Spread", "Alt Spread", "Total", "ML"],
-                                     default=["Spread", "Total", "ML"], key="parlay_type_filter")
+            # shared pool: positive EV, user-selected bet types
+            p_types = st.multiselect(
+                "Include bet types", ["Spread", "Alt Spread", "Total", "ML"],
+                default=["Spread", "Total", "ML"], key="parlay_type_filter",
+            )
+            base_pool = all_bets_alt[all_bets_alt["EV %"] >= min_ev].copy()
             if p_types:
-                parlay_pool = parlay_pool[parlay_pool["Type"].isin(p_types)]
-            parlay_pool = parlay_pool.sort_values("EV %", ascending=False)
+                base_pool = base_pool[base_pool["Type"].isin(p_types)]
+            # one bet per game max — keep the best EV within each tier per game
+            base_pool = base_pool.sort_values("EV %", ascending=False)
 
-            if parlay_pool.empty:
-                st.info("No positive-EV bets match the current filters. Lower the minimum EV slider or change bet types.")
+            def render_parlay(label, emoji, legs_df, note=""):
+                st.markdown(f"### {emoji} {label}")
+                if note:
+                    st.caption(note)
+                if legs_df.empty or len(legs_df) < 2:
+                    st.info("Not enough qualifying legs for this tier this week.")
+                    return
+                win_probs = (legs_df["Model Win %"] / 100).tolist()
+                combined_p, book_odds, ev_pct = parlay_american_odds(win_probs)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Legs", len(legs_df))
+                m2.metric("Combined Win %", f"{100 * combined_p:.1f}%")
+                odds_str = f"+{book_odds}" if book_odds >= 0 else str(book_odds)
+                m3.metric("Est. Payout (book)", odds_str)
+                ev_delta_color = "normal" if ev_pct >= 0 else "inverse"
+                m4.metric("Parlay EV %", f"{ev_pct:.1f}%",
+                          delta=f"{ev_pct:.1f}%", delta_color=ev_delta_color)
+                st.dataframe(
+                    legs_df[["Game", "Bet", "Type", "Model Win %", "EV %", "Points Edge"]],
+                    hide_index=True, column_config=BET_COLS,
+                )
+                st.divider()
+
+            if base_pool.empty:
+                st.info("No positive-EV bets match the current filters. "
+                        "Lower the minimum EV % slider or add more bet types.")
             else:
-                leg_options = parlay_pool["Bet"].tolist()
-                # Suggest the top 3 by EV as a default starting point
-                default_legs = leg_options[:min(3, len(leg_options))]
-                chosen_legs = st.multiselect("Select parlay legs", leg_options, default=default_legs,
-                                             help="Choose 2–8 legs. The builder assumes each leg is independent.")
+                # ── LOCKS: win % ≥ 65, up to 4 legs, sorted by win % desc
+                locks = (base_pool[base_pool["Model Win %"] >= 65]
+                         .drop_duplicates("Game")
+                         .sort_values("Model Win %", ascending=False)
+                         .head(4))
 
-                if len(chosen_legs) < 2:
-                    st.info("Select at least 2 legs to build a parlay.")
-                else:
-                    chosen = parlay_pool[parlay_pool["Bet"].isin(chosen_legs)].drop_duplicates("Bet")
-                    win_probs = (chosen["Model Win %"] / 100).tolist()
-                    combined_p, book_odds, ev_pct = parlay_american_odds(win_probs)
+                # ── MAYBE: win % 55–65, up to 4 legs, sorted by EV desc
+                maybe = (base_pool[(base_pool["Model Win %"] >= 55) &
+                                   (base_pool["Model Win %"] < 65)]
+                         .drop_duplicates("Game")
+                         .sort_values("EV %", ascending=False)
+                         .head(4))
 
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Legs", len(chosen_legs))
-                    m2.metric("Combined Win %", f"{100 * combined_p:.2f}%")
-                    book_odds_str = f"+{book_odds}" if book_odds >= 0 else str(book_odds)
-                    m3.metric("Est. Payout (book)", book_odds_str)
-                    ev_color = "normal" if ev_pct >= 0 else "inverse"
-                    m4.metric("Parlay EV %", f"{ev_pct:.1f}%", delta=f"{ev_pct:.1f}%", delta_color=ev_color)
+                # ── LONG SHOT: win % < 55 but positive EV, up to 4 legs, sorted by EV desc
+                longshot = (base_pool[base_pool["Model Win %"] < 55]
+                            .drop_duplicates("Game")
+                            .sort_values("EV %", ascending=False)
+                            .head(4))
 
-                    st.subheader("Parlay legs")
-                    st.dataframe(chosen[["Game", "Bet", "Type", "Model Win %", "EV %", "Points Edge"]],
-                                 hide_index=True, column_config=BET_COLS)
-
-                    if len(chosen_legs) > 4:
-                        st.warning("Parlays of 5+ legs have very low hit rates even with positive EV. "
-                                   "Consider splitting into smaller parlays.")
+                render_parlay(
+                    "Locks", "🔒", locks,
+                    "High-confidence legs (model win % ≥ 65%). Safer parlay, lower payout.",
+                )
+                render_parlay(
+                    "Maybe", "🤔", maybe,
+                    "Solid edge but not a lock (55–65% win). Balanced risk/reward.",
+                )
+                render_parlay(
+                    "Long Shot", "💣", longshot,
+                    "Lower win % but meaningful model edge. High payout if it hits — don't over-stake.",
+                )
 
     with tab4:
         st.caption("Points vs. an average FBS team. Defense is flipped so higher = better for both columns.")
